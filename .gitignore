@@ -10,6 +10,7 @@ build/
 
 # Virtual Environment
 sensor-trust-env/
+sensor-trust-env312/
 venv/
 env/
 .venv/
