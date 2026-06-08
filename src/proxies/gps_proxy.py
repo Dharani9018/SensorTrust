@@ -49,13 +49,45 @@ def extract_gps_heading_rate(oxts_data, dt=0.1035):
     return heading_rate
 
 
-def extract_all_gps_proxies(oxts_data, dt=0.1035):
-    """Extract all GPS motion proxies.
-    
-    Returns dict with keys: speed, heading, heading_rate
-    """
+def extract_all_gps_proxies(oxts_data, dt=0.1035, window=5):
+    """Extract all GPS motion proxies."""
     return {
         'speed': extract_gps_speed(oxts_data),
+        'delta_v': extract_gps_delta_v(oxts_data, window),
         'heading': extract_gps_heading(oxts_data),
         'heading_rate': extract_gps_heading_rate(oxts_data, dt)
     }
+
+def get_heading_gate_mask(gps_speed, min_speed=2.0):
+    """Return boolean mask: True where heading data is reliable.
+
+    GPS heading from consecutive positions is unreliable below ~2 m/s.
+    This mask gates the heading component of F1.
+
+    Args:
+        gps_speed: array of GPS forward speeds
+        min_speed: minimum speed for reliable heading (m/s)
+
+    Returns:
+        np.array of bool, same shape as gps_speed
+    """
+    return np.abs(gps_speed) >= min_speed
+
+def extract_gps_delta_v(oxts_data, window=5):
+    """Compute GPS-measured speed change over a sliding window.
+    
+    Args:
+        oxts_data: pykitti oxts list
+        window: number of frames for change computation
+    
+    Returns:
+        np.array of shape (N,) — speed change over window (m/s)
+        First `window` elements are NaN.
+    """
+    speed = extract_gps_speed(oxts_data)
+    delta_v = np.full(len(speed), np.nan)
+    
+    for i in range(window, len(speed)):
+        delta_v[i] = speed[i] - speed[i - window]
+    
+    return delta_v
