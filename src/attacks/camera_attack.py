@@ -168,7 +168,8 @@ def drop_frames(
 
     for i in range(
             interval,
-            len(attacked)
+            len(attacked),
+            interval
     ):
         attacked[i] = attacked[i - 1].copy()
 

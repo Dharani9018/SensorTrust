@@ -232,3 +232,82 @@ def coordinated_all_four(oxts_data, velo_scans, camera_frames, start_frame,
                 camera_attacked.append(camera_frames[i].copy())
     
     return gps_attacked, imu_attacked, lidar_attacked, camera_attacked, labels
+
+def coordinated_imu_lidar(
+        oxts_data,
+        velo_scans,
+        start_frame,
+        imu_bias=0.3,
+        phantom_points=100,
+        duration=50
+):
+    """
+    Coordinated IMU + LiDAR attack.
+
+    IMU acceleration is biased while LiDAR receives
+    phantom obstacle points.
+
+    GPS and Camera remain clean.
+    """
+
+    total = len(oxts_data)
+
+    labels = np.zeros(
+        total,
+        dtype=int
+    )
+
+    imu_attacked = []
+    lidar_attacked = []
+
+    for i, frame in enumerate(oxts_data):
+
+        pkt = frame.packet
+
+        imu_entry = {
+            'lat': pkt.lat,
+            'lon': pkt.lon,
+            'alt': pkt.alt,
+            'vf': pkt.vf,
+            'vl': pkt.vl,
+            'vu': pkt.vu,
+            'ax': pkt.ax,
+            'ay': pkt.ay,
+            'az': pkt.az,
+            'wx': pkt.wx,
+            'wy': pkt.wy,
+            'wz': pkt.wz
+        }
+
+        if start_frame <= i < start_frame + duration:
+
+            imu_entry['ax'] += imu_bias
+
+            labels[i] = 1
+
+        imu_attacked.append(
+            imu_entry
+        )
+
+        if i < len(velo_scans):
+
+            if start_frame <= i < start_frame + duration:
+
+                lidar_attacked.append(
+                    phantom_inject(
+                        velo_scans[i],
+                        phantom_points
+                    )
+                )
+
+            else:
+
+                lidar_attacked.append(
+                    velo_scans[i].copy()
+                )
+
+    return (
+        imu_attacked,
+        lidar_attacked,
+        labels
+    )

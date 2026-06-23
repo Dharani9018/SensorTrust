@@ -80,3 +80,35 @@ def point_removal(scan, fraction=0.3):
     n_keep = int(scan.shape[0] * (1 - fraction))
     indices = np.random.choice(scan.shape[0], n_keep, replace=False)
     return scan[indices]
+
+def remove_points_sequence(
+        velo_scans,
+        start_frame,
+        fraction=0.3,
+        duration=None
+):
+    total = len(velo_scans)
+
+    if duration is None:
+        duration = total - start_frame
+
+    attacked = []
+    labels = np.zeros(total, dtype=int)
+
+    for i, scan in enumerate(velo_scans):
+
+        if start_frame <= i < start_frame + duration:
+
+            attacked.append(
+                point_removal(
+                    scan,
+                    fraction
+                )
+            )
+
+            labels[i] = 1
+
+        else:
+            attacked.append(scan.copy())
+
+    return attacked, labels
