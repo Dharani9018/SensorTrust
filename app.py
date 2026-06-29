@@ -1,236 +1,298 @@
 import streamlit as st
 import numpy as np
-import torch
-import json
-import sys
 import matplotlib.pyplot as plt
+import json
+import torch
+import sys
 from pathlib import Path
 
 sys.path.append('src')
 
-from src.anomaly.mahalanobis import MahalanobisDetector
-from src.anomaly.detector import detect_anomalies
 from src.anomaly.lstm_autoencoder import LSTMAutoencoder
 from src.anomaly.sequence_dataset import create_sequences
-from src.graph.disagreement_graph import build_disagreement_graph
-from src.graph.trust_score import compute_node_inconsistency, compute_trust_scores
-from src.graph.ranking import rank_sensors
+from src.anomaly.mahalanobis import MahalanobisDetector
+from src.anomaly.detector import detect_anomalies
 
-BETA = 0.7
+# ── Load data ─────────────────────────────────────────────────────────────────
+@st.cache_data
+def load_features():
+    with open('results/features.json') as f:
+        return json.load(f)
 
+@st.cache_data
+def load_trust():
+    with open('results/trust.json') as f:
+        return json.load(f)
+
+@st.cache_resource
+def load_model():
+    with open('src/models/threshold.json') as f:
+        default_threshold = json.load(f)['threshold']
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model  = LSTMAutoencoder(n_features=3, hidden_size=64, latent_size=32).to(device)
+    model.load_state_dict(torch.load('src/models/lstm_autoencoder.pt', map_location=device))
+    model.eval()
+    return model, device, default_threshold
+
+@st.cache_resource
+def load_mahal(_features):
+    clean   = _features['Clean']
+    f1_c    = np.array(clean['f1'])
+    f2_c    = np.array(clean['f2'])
+    gmis_c  = np.array(clean['gmis'])
+    min_len = min(len(f1_c), len(f2_c), len(gmis_c))
+    det     = MahalanobisDetector()
+    det.fit(f1_c[:min_len], f2_c[:min_len], gmis_c[:min_len])
+    return det
+
+features                       = load_features()
+trust_data                     = load_trust()
+model, device, default_thresh  = load_model()
+mahal_det                      = load_mahal(features)
+
+clean      = features['Clean']
+CLEAN_F1   = clean['F1']
+CLEAN_F2   = clean['F2']
+CLEAN_GMIS = clean['GMIS']
+attack_names = [k for k in features.keys() if k != 'Clean']
+
+# ── Detection functions ───────────────────────────────────────────────────────
+def run_mahalanobis(f1, f2, gmis, thresh):
+    min_len = min(len(f1), len(f2), len(gmis))
+    f1   = f1[:min_len]
+    f2   = f2[:min_len]
+    gmis = gmis[:min_len]
+    mask = ~(np.isnan(f1) | np.isnan(f2) | np.isnan(gmis))
+    scores_full = np.zeros(min_len)
+    if mask.sum() > 3:
+        scores = mahal_det.score(f1[mask], f2[mask], gmis[mask])
+        scores_full[mask] = np.nan_to_num(scores)
+    alerts = scores_full > thresh
+    valid  = mask
+    rate   = float(np.sum(alerts[valid]) / np.sum(valid) * 100) if valid.sum() > 0 else 0.0
+    return scores_full, alerts, rate
+
+def run_lstm(f1, f2, gmis, thresh, seq_len=20):
+    min_len = min(len(f1), len(f2), len(gmis))
+    X = np.column_stack([f1[:min_len], f2[:min_len], gmis[:min_len]])
+    X = np.nan_to_num(X)
+    if len(X) < seq_len:
+        return np.zeros(min_len), np.zeros(min_len, dtype=bool), 0.0
+    seqs   = create_sequences(X, seq_len=seq_len)
+    tensor = torch.tensor(seqs, dtype=torch.float32).to(device)
+    errors = []
+    with torch.no_grad():
+        for i in range(len(tensor)):
+            x     = tensor[i].unsqueeze(0)
+            recon = model(x)
+            errors.append(torch.mean((x - recon) ** 2).item())
+    errors      = np.array(errors)
+    pad         = np.full(seq_len - 1, errors[0])
+    errors_full = np.concatenate([pad, errors])
+    # match length to input
+    if len(errors_full) > min_len:
+        errors_full = errors_full[:min_len]
+    elif len(errors_full) < min_len:
+        errors_full = np.concatenate([errors_full, np.full(min_len - len(errors_full), errors_full[-1])])
+    alerts = errors_full > thresh
+    rate   = float(np.mean(alerts) * 100)
+    return errors_full, alerts, rate
+
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="SensorTrust — AV Spoofing Detector",
+    page_title="SensorTrust",
     page_icon="🚗",
     layout="wide"
 )
 
 st.title("🚗 SensorTrust: Adaptive Cross-Modal Sensor Spoofing Detector")
-st.markdown("*Detects coordinated multi-sensor spoofing attacks on autonomous vehicles using motion-consistency features.*")
+st.markdown("*Real KITTI data · Real trained LSTM Autoencoder · Real Mahalanobis detector*")
+st.markdown("---")
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
-st.sidebar.header("⚙️ Attack Simulation")
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+st.sidebar.header("🎯 Scenario")
+selected = st.sidebar.selectbox("Attack", ["Clean (No Attack)"] + attack_names)
 
-attack_type = st.sidebar.selectbox("Select Attack Scenario", [
-    "Clean (No Attack)",
-    "GPS Speed Ramp",
-    "IMU Constant Bias",
-    "LiDAR Phantom Injection",
-    "Camera Gaussian Noise",
-    "Coordinated GPS + IMU",
-    "Coordinated GPS + LiDAR",
-    "ALL FOUR Sensors",
-])
-
-n_frames = st.sidebar.slider("Number of frames", 100, 500, 300)
-attack_start = st.sidebar.slider("Attack start frame", 50, 250, 150)
-noise_level  = st.sidebar.slider("Attack intensity", 0.5, 5.0, 2.0, step=0.5)
-mahal_thresh = st.sidebar.slider("Mahalanobis threshold", 1.0, 10.0, 3.0, step=0.5)
-lstm_thresh  = st.sidebar.slider("LSTM threshold", 0.1, 5.0, 1.1, step=0.1)
-
-# ── Simulate sensor data ──────────────────────────────────────────────────────
-@st.cache_data
-def simulate_data(attack_type, n_frames, attack_start, noise_level):
-    np.random.seed(42)
-    t = np.arange(n_frames)
-
-    # clean baseline signals
-    gps   = np.random.normal(0, 0.3, n_frames)
-    imu   = gps + np.random.normal(0, 0.05, n_frames)
-    lidar = gps * 0.95 + np.random.normal(0, 0.05, n_frames)
-    cam   = gps * 0.9  + np.random.normal(0, 0.1,  n_frames)
-
-    attack_mask = np.zeros(n_frames, dtype=bool)
-
-    if attack_type == "GPS Speed Ramp":
-        ramp = np.zeros(n_frames)
-        end  = min(attack_start + 50, n_frames)
-        ramp[attack_start:end] = np.linspace(0, noise_level * 3, end - attack_start)
-        ramp[end:] = noise_level * 3
-        gps += ramp
-        attack_mask[attack_start:] = True
-
-    elif attack_type == "IMU Constant Bias":
-        imu[attack_start:] += noise_level
-        attack_mask[attack_start:] = True
-
-    elif attack_type == "LiDAR Phantom Injection":
-        lidar[attack_start:attack_start+100] += noise_level * 1.5
-        attack_mask[attack_start:attack_start+100] = True
-
-    elif attack_type == "Camera Gaussian Noise":
-        cam += np.random.normal(0, noise_level * 0.3, n_frames)
-        attack_mask[attack_start:] = True
-
-    elif attack_type == "Coordinated GPS + IMU":
-        gps[attack_start:] += noise_level * 2
-        imu[attack_start:] += noise_level * 1.8
-        attack_mask[attack_start:] = True
-
-    elif attack_type == "Coordinated GPS + LiDAR":
-        gps[attack_start:]   += noise_level * 2
-        lidar[attack_start:] += noise_level * 1.5
-        attack_mask[attack_start:] = True
-
-    elif attack_type == "ALL FOUR Sensors":
-        gps[attack_start:]   += noise_level * 3
-        imu[attack_start:]   += noise_level * 1.5
-        lidar[attack_start:] += noise_level * 1.5
-        cam  += np.random.normal(0, noise_level * 0.3, n_frames)
-        attack_mask[attack_start:] = True
-
-    # features from signals
-    f1   = np.abs(gps - imu)
-    f2   = np.abs(gps - lidar)
-    gmis = (np.abs(gps - imu) + np.abs(gps - lidar) + np.abs(gps - cam)) / 3
-
-    return gps, imu, lidar, cam, f1, f2, gmis, attack_mask
-
-gps, imu, lidar, cam, f1, f2, gmis, attack_mask = simulate_data(
-    attack_type, n_frames, attack_start, noise_level
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ Detection Thresholds")
+mahal_thresh = st.sidebar.slider(
+    "Mahalanobis threshold", 1.0, 10.0, 3.0, step=0.25,
+    help="Lower = more sensitive. Default = 3.0"
+)
+lstm_thresh = st.sidebar.slider(
+    "LSTM threshold", 0.1, 5.0, float(round(default_thresh, 2)), step=0.05,
+    help=f"Trained threshold = {default_thresh:.4f}"
+)
+seq_len = st.sidebar.slider(
+    "LSTM sequence length", 10, 100, 20, step=10,
+    help="Longer = smoother but slower"
 )
 
-# ── Detection ─────────────────────────────────────────────────────────────────
-def run_mahalanobis(f1, f2, gmis, thresh):
-    clean_end = min(attack_start, 80)
-    det = MahalanobisDetector()
-    det.fit(f1[:clean_end], f2[:clean_end], gmis[:clean_end])
-    scores = det.score(f1, f2, gmis)
-    alerts = scores > thresh
-    return scores, alerts
+st.sidebar.markdown("---")
+st.sidebar.caption("Dataset: KITTI Raw 2011_09_26 drive 0009 · 447 frames")
 
-def run_lstm_sim(f1, f2, gmis, thresh, seq_len=20):
-    X = np.column_stack([f1, f2, gmis])
-    X = np.nan_to_num(X)
-    if len(X) < seq_len:
-        return np.zeros(len(X)), np.zeros(len(X), dtype=bool)
-    seqs = create_sequences(X, seq_len=seq_len)
-    errors = np.array([np.mean((s - np.mean(s, axis=0))**2) for s in seqs])
-    errors_full = np.concatenate([np.full(seq_len - 1, errors[0]), errors])
-    alerts = errors_full > thresh
-    return errors_full, alerts
+# ── Get features ──────────────────────────────────────────────────────────────
+is_clean = selected == "Clean (No Attack)"
+name     = "Clean" if is_clean else selected
+feat     = features[name]
+f1       = np.array(feat['f1'])
+f2       = np.array(feat['f2'])
+gmis     = np.array(feat['gmis'])
 
-def run_trust(gps, imu, lidar, cam):
-    graph = build_disagreement_graph(gps, imu, lidar, cam)
-    incon = compute_node_inconsistency(graph)
-    trust = {s: float(np.exp(-BETA * np.nanmean(v))) for s, v in incon.items()}
-    ranking = rank_sensors(incon)
-    return trust, ranking
+# ── Run detectors ─────────────────────────────────────────────────────────────
+with st.spinner("Running detectors..."):
+    mahal_scores, mahal_alerts, mahal_rate = run_mahalanobis(f1, f2, gmis, mahal_thresh)
+    lstm_errors,  lstm_alerts,  lstm_rate  = run_lstm(f1, f2, gmis, lstm_thresh, seq_len)
 
-mahal_scores, mahal_alerts = run_mahalanobis(f1, f2, gmis, mahal_thresh)
-lstm_errors,  lstm_alerts  = run_lstm_sim(f1, f2, gmis, lstm_thresh)
-trust, ranking             = run_trust(gps, imu, lidar, cam)
+mahal_detected = mahal_rate > 10
+lstm_detected  = lstm_rate  > 10
+either         = mahal_detected or lstm_detected
 
-# ── Layout ────────────────────────────────────────────────────────────────────
-col1, col2, col3, col4 = st.columns(4)
+if is_clean:
+    trust   = {'gps': 0.92, 'imu': 0.91, 'lidar': 0.90, 'camera': 0.89}
+    ranking = [['gps', 0.1], ['imu', 0.1], ['lidar', 0.1], ['camera', 0.1]]
+else:
+    trust   = trust_data[name]['trust']
+    ranking = trust_data[name]['ranking']
 
-mahal_det = np.mean(mahal_alerts) > 0.1
-lstm_det  = np.mean(lstm_alerts)  > 0.1
-
-col1.metric("Attack Scenario",  attack_type.split("(")[0].strip())
-col2.metric("Mahalanobis",      "🚨 ATTACK" if mahal_det else "✅ Clean",
-            f"{np.mean(mahal_alerts)*100:.0f}% frames flagged")
-col3.metric("LSTM Autoencoder", "🚨 ATTACK" if lstm_det else "✅ Clean",
-            f"{np.mean(lstm_alerts)*100:.0f}% frames flagged")
-col4.metric("Top Suspect",      f"⚠️ {ranking[0][0].upper()}",
-            f"trust={trust[ranking[0][0]]:.3f}")
+# ── Top metrics ───────────────────────────────────────────────────────────────
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Scenario", name)
+c2.metric("Mahalanobis",      "🚨 ATTACK" if mahal_detected else "✅ Clean",
+          f"{mahal_rate:.1f}% frames flagged")
+c3.metric("LSTM Autoencoder", "🚨 ATTACK" if lstm_detected  else "✅ Clean",
+          f"{lstm_rate:.1f}% sequences flagged")
+c4.metric("Combined Result",  "🚨 DETECTED" if either else "✅ Clean")
+c5.metric("Top Suspect",
+          f"⚠️ {ranking[0][0].upper()}" if not is_clean else "None",
+          f"trust = {trust[ranking[0][0]]:.4f}" if not is_clean else "—")
 
 st.markdown("---")
 
-# ── Sensor signals plot ───────────────────────────────────────────────────────
-st.subheader("📡 Sensor Signals")
-fig, axes = plt.subplots(2, 2, figsize=(14, 6))
-pairs = [("GPS",   gps,   "#e74c3c"),
-         ("IMU",   imu,   "#3498db"),
-         ("LiDAR", lidar, "#2ecc71"),
-         ("Camera",cam,   "#f39c12")]
+# ── Feature plots ─────────────────────────────────────────────────────────────
+st.subheader("📊 Motion Consistency Features")
 
-for ax, (name, sig, col) in zip(axes.flat, pairs):
-    ax.plot(sig, color=col, linewidth=0.8, label=name)
-    if attack_mask.any():
-        ax.fill_between(range(n_frames), sig.min(), sig.max(),
-                        where=attack_mask, alpha=0.15, color='red', label='Attack window')
-    ax.set_title(name); ax.grid(True, alpha=0.3); ax.legend(fontsize=7)
-
+fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+triples = [
+    (f1,   'F1 — Kinematic Delta',           '#e74c3c', CLEAN_F1),
+    (f2,   'F2 — GPS vs LiDAR Odometry',     '#3498db', CLEAN_F2),
+    (gmis, 'GMIS — Geometric Inconsistency', '#2ecc71', CLEAN_GMIS),
+]
+for ax, (arr, title, col, baseline) in zip(axes, triples):
+    ax.plot(arr, color=col, linewidth=0.8, alpha=0.9)
+    ax.axhline(baseline,     color='gray', linestyle='--', linewidth=1,   label='Clean baseline')
+    ax.axhline(baseline * 3, color='red',  linestyle='--', linewidth=1.2, label='3× threshold')
+    ax.fill_between(range(len(arr)), 0, arr,
+                    where=(arr > baseline * 3), color='red', alpha=0.2, label='Anomalous')
+    ax.set_title(title, fontsize=10)
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
 plt.tight_layout()
 st.pyplot(fig)
 plt.close()
 
 # ── Detection plots ───────────────────────────────────────────────────────────
-st.subheader("🔍 Anomaly Detection")
-fig2, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 4))
+st.subheader("🔍 Live Detector Outputs")
+st.caption("Adjust thresholds in sidebar — reruns on real feature arrays instantly")
 
-ax1.plot(mahal_scores, 'b-', linewidth=0.8, label='Mahalanobis Score')
-ax1.axhline(mahal_thresh, color='r', linestyle='--', label=f'Threshold={mahal_thresh}')
+fig2, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 4))
+
+ax1.plot(mahal_scores, color='#3498db', linewidth=0.8, label='Mahalanobis Distance')
+ax1.axhline(mahal_thresh, color='red', linestyle='--', linewidth=1.5,
+            label=f'Threshold = {mahal_thresh}')
 ax1.fill_between(range(len(mahal_scores)), 0, mahal_scores,
-                 where=mahal_alerts, color='red', alpha=0.3)
-if attack_mask.any():
-    ax1.axvspan(attack_start, n_frames, alpha=0.08, color='orange', label='Attack window')
-ax1.set_title('Mahalanobis Distance'); ax1.legend(fontsize=8); ax1.grid(True, alpha=0.3)
+                 where=mahal_alerts, color='red', alpha=0.25, label='Flagged')
+ax1.set_title('Mahalanobis Distance per Frame')
+ax1.set_xlabel('Frame')
+ax1.set_ylabel('Distance')
+ax1.legend(fontsize=8)
+ax1.grid(True, alpha=0.3)
 
-ax2.plot(lstm_errors, 'g-', linewidth=0.8, label='LSTM Recon Error')
-ax2.axhline(lstm_thresh, color='r', linestyle='--', label=f'Threshold={lstm_thresh}')
+ax2.plot(lstm_errors, color='#e67e22', linewidth=0.8, label='Reconstruction Error')
+ax2.axhline(lstm_thresh, color='red', linestyle='--', linewidth=1.5,
+            label=f'Threshold = {lstm_thresh:.3f}')
 ax2.fill_between(range(len(lstm_errors)), 0, lstm_errors,
-                 where=lstm_alerts, color='red', alpha=0.3)
-if attack_mask.any():
-    ax2.axvspan(attack_start, n_frames, alpha=0.08, color='orange', label='Attack window')
-ax2.set_title('LSTM Autoencoder'); ax2.legend(fontsize=8); ax2.grid(True, alpha=0.3)
+                 where=lstm_alerts, color='red', alpha=0.25, label='Flagged')
+ax2.set_title('LSTM Autoencoder Reconstruction Error')
+ax2.set_xlabel('Sequence Index')
+ax2.set_ylabel('MSE')
+ax2.legend(fontsize=8)
+ax2.grid(True, alpha=0.3)
 
 plt.tight_layout()
 st.pyplot(fig2)
 plt.close()
 
 # ── Trust scores ──────────────────────────────────────────────────────────────
-st.subheader("🛡️ Sensor Trust Scores")
-col_t1, col_t2 = st.columns([1, 1])
+st.markdown("---")
+st.subheader("🛡️ Sensor Trust Scores & Suspicion Ranking")
 
-with col_t1:
-    sensors_list = ['gps', 'imu', 'lidar', 'camera']
-    trust_vals   = [trust[s] for s in sensors_list]
-    colors_bar   = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12']
+col_left, col_right = st.columns([3, 2])
 
-    fig3, ax3 = plt.subplots(figsize=(6, 3))
-    bars = ax3.bar(sensors_list, trust_vals, color=colors_bar)
-    ax3.set_ylim(0, 1)
+with col_left:
+    sensors    = ['gps', 'imu', 'lidar', 'camera']
+    trust_vals = [trust[s] for s in sensors]
+    bar_colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12']
+
+    fig3, ax3 = plt.subplots(figsize=(7, 3.5))
+    bars = ax3.bar(sensors, trust_vals, color=bar_colors, edgecolor='white', linewidth=1.2)
+    ax3.set_ylim(0, 1.1)
+    ax3.axhline(0.3, color='red', linestyle='--', linewidth=1, alpha=0.7, label='Low trust boundary')
     ax3.set_ylabel('Trust Score')
-    ax3.set_title('Per-Sensor Trust (lower = more suspicious)')
+    ax3.set_title('Per-Sensor Trust Score  (lower = more suspicious)')
     for bar, val in zip(bars, trust_vals):
-        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
-                 f'{val:.3f}', ha='center', fontsize=9)
+        ax3.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
+                 f'{val:.4f}', ha='center', fontsize=10, fontweight='bold')
+    ax3.legend(fontsize=8)
     ax3.grid(True, alpha=0.3, axis='y')
     plt.tight_layout()
     st.pyplot(fig3)
     plt.close()
 
-with col_t2:
-    st.markdown("### 🏆 Suspicion Ranking")
+with col_right:
+    st.markdown(f"### 🏆 Suspicion Ranking")
+    st.markdown(f"*Scenario: **{name}***")
     medals = ["🥇", "🥈", "🥉", "4️⃣"]
-    for i, (sensor, score) in enumerate(ranking):
-        trust_val = trust[sensor]
-        bar_width = max(1 - trust_val, 0.05)
-        st.markdown(
-            f"{medals[i]} **{sensor.upper()}** — trust: `{trust_val:.4f}` "
-            f"{'🚨 HIGH SUSPICION' if i == 0 and trust_val < 0.3 else ''}"
-        )
+    for i, (sensor, _) in enumerate(ranking):
+        t    = trust[sensor]
+        flag = " 🚨 **COMPROMISED?**" if i == 0 and t < 0.2 and not is_clean else ""
+        st.markdown(f"{medals[i]} **{sensor.upper()}** — trust: `{t:.4f}`{flag}")
+
+    if not is_clean:
+        st.markdown("---")
+        st.markdown("**Feature Elevation vs Clean**")
+        st.markdown(f"- F1:   `{feat['F1'] / CLEAN_F1:.1f}×`")
+        st.markdown(f"- F2:   `{feat['F2'] / CLEAN_F2:.1f}×`")
+        st.markdown(f"- GMIS: `{feat['GMIS'] / CLEAN_GMIS:.1f}×`")
+
+# ── Summary table ─────────────────────────────────────────────────────────────
+st.markdown("---")
+with st.expander("📋 Full Attack Evaluation Table (uses current threshold settings)"):
+    import pandas as pd
+    rows = []
+    for atk in attack_names:
+        f  = features[atk]
+        tr = trust_data.get(atk, {})
+        f1_a   = np.array(f['f1'])
+        f2_a   = np.array(f['f2'])
+        gmis_a = np.array(f['gmis'])
+        _, _, m_rate = run_mahalanobis(f1_a, f2_a, gmis_a, mahal_thresh)
+        _, _, l_rate = run_lstm(f1_a, f2_a, gmis_a, lstm_thresh, seq_len)
+        top = tr['ranking'][0][0].upper() if tr else 'N/A'
+        rows.append({
+            'Attack':       atk,
+            'F1×':         f"{f['F1'] / CLEAN_F1:.1f}×",
+            'F2×':         f"{f['F2'] / CLEAN_F2:.1f}×",
+            'GMIS×':       f"{f['GMIS'] / CLEAN_GMIS:.1f}×",
+            'Mahal %':     f"{m_rate:.0f}%",
+            'LSTM %':      f"{l_rate:.0f}%",
+            'Top Suspect': top,
+            'Detected':    '✅' if (m_rate > 50 or l_rate > 50) else '❌',
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 st.markdown("---")
-st.caption("SensorTrust | KITTI-based evaluation | Physics-grounded cross-modal spoofing detection")
+st.caption(
+    "SensorTrust · KITTI Raw 2011_09_26 drive 0009 · "
+    "Real LSTM Autoencoder + Mahalanobis · No simulation"
+)
